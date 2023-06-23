@@ -1,0 +1,122 @@
+// AUTOMATICALLY GENERATED: location from saved link.
+Map.setCenter(26.295382383096012, 57.73433658692449, 9)
+
+/*Created on 16th of June by Katharina H.*/
+var latlngProjection = ee.Projection('EPSG:4326');
+var latviaTM = ee.Projection('EPSG:32634');
+var pseudoMercator = ee.Projection('EPSG:3857');
+var geometry = [
+ee.Geometry.Point([26.120424, 57.699489], {name: 'Vegplot A1'}), /*required argument (crs) missing*/
+ee.Geometry.Point([26.119991, 57.699495], {name: 'Vegplot A2a'}),
+ee.Geometry.Point([26.119347, 57.699409], {name: 'Vegplot A2'}),
+ee.Geometry.Point([26.118094, 57.699167], {name: 'Vegplot A3'}),
+ee.Geometry.Point([26.116627, 57.698968], {name: 'Vegplot A4'}),
+ee.Geometry.Point([26.113131, 57.698759], {name: 'Vegplot A5'}),
+ee.Geometry.Point([26.111703, 57.698634], {name: 'Vegplot A6'}),
+ee.Geometry.Point([26.106717, 57.705509], {name: 'Vegplot B1'}),
+ee.Geometry.Point([26.106605, 57.705295], {name: 'Vegplot B2'}),
+ee.Geometry.Point([26.106306, 57.704812], {name: 'Vegplot B3'}),
+ee.Geometry.Point([26.105982, 57.703938], {name: 'Vegplot B4'}),
+ee.Geometry.Point([26.105771, 57.703822], {name: 'Vegplot B5'}),
+ee.Geometry.Point([26.105597, 57.702384], {name: 'Vegplot B6'}),
+ee.Geometry.Point([26.105010, 57.701997], {name: 'Vegplot B7'}),
+ee.Geometry.Point([26.105647, 57.701944], {name: 'Vegplot B8'}),
+ee.Geometry.Point([26.104865, 57.701266], {name: 'Vegplot B9'}),
+ee.Geometry.Point([26.109494, 57.700563], {name: 'Vegplot B10'}),
+ee.Geometry.Point([26.109285, 57.700291], {name: 'Vegplot B11'}),
+]; 
+
+var vegplots = ee.Geometry.MultiPoint(geometry);
+
+
+var vegplots = ee.FeatureCollection(geometry.map(function(point) {
+  return ee.Feature(point).set('system:index', point.getInfo().name);
+}));
+
+Map.addLayer(vegplots)
+
+var transformedpoints = vegplots.map(function(feature) {
+  var geom = feature.geometry();
+  var transformGeom = geom.transform(latviaTM, pseudoMercator);
+  return  ee.Feature(transformGeom, feature.toDictionary());
+});
+
+Map.addLayer(transformedpoints);
+print(transformedpoints);
+/*Comment: the rest of the script is a suggestion of ChatGPT, 
+I was busy with checking the coordinates and figuring out how the RF regression might look like.
+The script is obviously not complete*/
+//Sentinel-2 Data
+var sentinel = ee.ImageCollection("COPERNICUS/S2_SR")
+.filterDate('2017-01-01', '2022-12-31')
+.filterBounds(transformedpoints);
+
+// Soil parameters data
+var boden = ee.Image("OpenLandMap/SOL/SOL_TEXTURE-CLASS_USDA-TT_M/v02")
+.select("b0");
+
+// Soil moisture data
+
+var boden_feuchte = ee.ImageCollection("NASA_USDA/HSL/SMAP_soil_moisture")
+.filterDate('2018-01-01', '2019-12-31')
+.filterBounds(geometry)
+.select("ssm");
+
+// Vegetations-Indices
+var ndvi = sentinel.map(function(im){
+return im.normalizedDifference(['B8','B4']).rename('ndvi').copyProperties(im, ['system:time_start']);
+});
+
+var evi = sentinel.map(function(im){
+return im.expression('(B8 - B4) / (B8 + 6 * B4 - 7.5 * B2 + 1)', {
+'B8': im.select('B8'),
+'B4': im.select('B4'),
+'B2': im.select('B2')
+}).rename('evi').copyProperties(im, ['system:time_start']);
+});
+
+var savi = sentinel.map(function(im){
+return im.expression('(B8 - B4) / (B8 + B4 + 0.5)', {
+'B8': im.select('B8'),
+'B4': im.select('B4'),
+}).rename('savi').copyProperties(im, ['system:time_start']);
+});
+
+var mtvi = sentinel.map(function(im){
+  return im.expression()
+})
+
+// Training data
+var train = biomass.addBands(ndvi)
+.addBands(evi)
+.addBands(savi)
+.addBands(boden)
+.addBands(boden_feuchte)
+.sample({
+region:geometry,
+scale:10,
+numPixels:10000
+});
+
+// Modellieren des Random Forest Regression
+var rf = ee.FeatureCollection.randomTrees({
+features:train,
+inputProperties:['B4', 'B8', 'ndvi', 'evi', 'savi', 'b0', 'ssm'],
+outputProperties:['biomass'],
+numberOfTrees:100
+});
+
+// Validation of prediction
+var predictions = train.classify(rf);
+
+// Ausgabe der Ergebnisse
+print(predictions);
+Map.addLayer(predictions, {bands:['biomass'], min:0, max:20}, 'Above ground biomass Prediction');
+
+// Export der Ergebnisse
+Export.table.toDrive({
+collection:predictions,
+description:'Biomass_prediction',
+folder:'GEE_Biomass_Prediction',
+fileFormat:'CSV'
+});
