@@ -1,0 +1,222 @@
+var year = 2019; // Start year for composite
+var startJulian = 100; // Starting Julian Date
+var endJulian = 272; // Ending Julian date
+var compositingPeriod = 0; // Number of years into the future to include
+var compositeArea = VT_boundary.geometry().bounds(); // ROI shapefile/asset or polygon
+var roiName = ‘Essex VT’; // Give the study area a descriptive name.
+var exportToDrive = 'no'; // Option to export landsat composite to drive
+var crs = 'EPSG:32618'; // EPSG number for output projection. 32618 = WGS84/UTM Zone 18N. For more info- http://spatialreference.org/ref/epsg/    
+var loadData = require('users/USFS_GTAC/GTAC-Training:DigitalSoilMapping/03_Library/DSM_Lib');
+var inImage = loadData.getComp(compositeArea, year, compositingPeriod, startJulian, endJulian, exportToDrive, roiName, crs);
+var inSpectral = loadData.getSpectralIndices(inImage, crs);
+var inSpectralTopo = loadData.getTopo(inSpectral, crs);
+var inSpectralTopoClimate = loadData.getClimate(inSpectralTopo, year, compositingPeriod, crs);
+var inStack = inSpectralTopoClimate.reproject(crs, null, 30);
+print("Predictor Layers:", inStack);
+//prepare training/ validation data
+var data = ee.FeatureCollection(VT_pedons, 'geometry');
+var datawithColumn = data.randomColumn('random');
+var split = 0.7; // separate 70% for training, 30% for validation
+var trainingData = datawithColumn.filter(ee.Filter.lt('random', split));
+var validationData = datawithColumn.filter(ee.Filter.gte('random', split));
+// Run Random Forest Regression
+var bands = inStack.bandNames(); //All bands on included here
+// collect training data
+var training = inStack.select(bands).sampleRegions({
+  collection: trainingData,
+  properties: ['REDOX_CM'],
+  scale: 30 
+  });
+// Run RF classifier
+var classifier = ee.Classifier.smileRandomForest(100, null, 1, 0.5, null, 0)
+  .setOutputMode('REGRESSION')
+  .train({
+    features: training,
+    classProperty: 'REDOX_CM',
+    inputProperties: bands
+    });
+// classify image
+var regression = inStack.select(bands).classify(classifier, 'predicted');
+// load and define a continous palette
+var palettes = require('users/gena/packages:palettes');
+var palette = palettes.crameri.nuuk[25];
+// Display the input imagery and the regression classification.
+  // get dictionaries of min & max predicted value
+  var regressionMin = (regression.reduceRegion({
+    reducer: ee.Reducer.min(),
+    scale: 30, 
+    crs: crs,
+    bestEffort: true,
+    tileScale: 5
+  }));
+  var regressionMax = (regression.reduceRegion({
+    reducer: ee.Reducer.max(),
+    scale: 30, 
+    crs: crs,
+    bestEffort: true,
+    tileScale: 5
+  }));
+// Add to map
+var viz = {palette: palette, min: regressionMin.getNumber('predicted').getInfo(), max: regressionMax.getNumber('predicted').getInfo()};
+Map.addLayer(regression, viz, 'Regression');
+//make a legend and add it to the map
+// Create the panel for the legend items.
+var legend = ui.Panel({
+  style: {
+    position: 'bottom-left',
+    padding: '8px 15px'
+  }
+});
+
+// Create and add the legend title.
+var legendTitle = ui.Label({
+  value: 'Legend',
+  style: {
+    fontWeight: 'bold',
+    fontSize: '18px',
+    margin: '0 0 4px 0',
+    padding: '0'
+  }
+});
+legend.add(legendTitle);
+
+// create the legend image
+var lon = ee.Image.pixelLonLat().select('latitude');
+var gradient = lon.multiply((viz.max-viz.min)/100.0).add(viz.min);
+var legendImage = gradient.visualize(viz);
+ 
+// create text on top of legend
+var panel = ui.Panel({
+widgets: [
+ui.Label(viz['max'])
+],
+});
+ 
+legend.add(panel);
+ 
+// create thumbnail from the image
+var thumbnail = ui.Thumbnail({
+image: legendImage,
+params: {bbox:'0,0,10,100', dimensions:'10x200'},
+style: {padding: '1px', position: 'bottom-center'}
+});
+ 
+// add the thumbnail to the legend
+legend.add(thumbnail);
+ 
+// create text on top of legend
+var panel = ui.Panel({
+widgets: [
+ui.Label(viz['min'])
+],
+});
+ 
+legend.add(panel);
+Map.add(legend);
+
+// Zoom to the regression on the map
+Map.centerObject(compositeArea, 11);
+// Plot assessment tools
+// Get variable importance
+var dict = classifier.explain();
+print("Classifier information:", dict);
+var variableImportance = ee.Feature(null, ee.Dictionary(dict).get('importance'));
+// Make chart, print it
+var chart =
+ui.Chart.feature.byProperty(variableImportance)
+.setChartType('ColumnChart')
+.setOptions({
+title: 'Random Forest Variable Importance',
+legend: {position: 'none'},
+hAxis: {title: 'Bands'},
+vAxis: {title: 'Importance'}
+});
+print(chart);
+//Histogram of predicted redox depth
+// Set chart options
+var options = {
+lineWidth: 1,
+pointSize: 2,
+hAxis: {title: 'Redox (cm)'},
+vAxis: {title: 'Num of pixels'},
+title: 'Number of pixels by redox depth'
+}; 
+var regressionPixelChart = ui.Chart.image.histogram({
+  image: ee.Image(regression),
+  region: compositeArea,
+}).setOptions(options);
+print(regressionPixelChart);
+// Get predicted regression points in same location as training data
+var predictedTraining = regression.sampleRegions({collection:trainingData, geometries: true});
+// Separate the observed (REDOX_CM) and predicted (regression) properties
+var sampleTraining = predictedTraining.select(['REDOX_CM', 'predicted']);
+// Create chart, print it
+var chartTraining = ui.Chart.feature.byFeature(sampleTraining, 'REDOX_CM', 'predicted')
+.setChartType('ScatterChart').setOptions({
+title: 'Predicted vs Observed - Training data ',
+hAxis: {'title': 'observed'},
+vAxis: {'title': 'predicted'},
+pointSize: 3,
+trendlines: { 0: {showR2: true, visibleInLegend: true} ,
+1: {showR2: true, visibleInLegend: true}}});
+print(chartTraining);
+//RMSE
+// Get array of observation and prediction values 
+var observationTraining = ee.Array(sampleTraining.aggregate_array('REDOX_CM'));
+var predictionTraining = ee.Array(sampleTraining.aggregate_array('predicted'));
+// Compute residuals
+var residualsTraining = observationTraining.subtract(predictionTraining);
+// Compute RMSE with equation, print it
+var rmseTraining = residualsTraining.pow(2).reduce('mean', [0]).sqrt();
+print('Training RMSE', rmseTraining);
+//Validation
+//Plot observed vs. predicted for training data
+// Get predicted regression points in same location as validation data
+var predictedValidation = regression.sampleRegions({collection:validationData, geometries: true});
+// Separate the observed (REDOX_CM) and predicted (regression) properties
+var sampleValidation = predictedValidation.select(['REDOX_CM', 'predicted']);
+// Create chart, print it
+var chartValidation = ui.Chart.feature.byFeature(sampleValidation, 'predicted', 'REDOX_CM')
+.setChartType('ScatterChart').setOptions({
+title: 'Predicted vs Observed - Validation data',
+hAxis: {'title': 'predicted'},
+vAxis: {'title': 'observed'},
+pointSize: 3,
+trendlines: { 0: {showR2: true, visibleInLegend: true} ,
+1: {showR2: true, visibleInLegend: true}}});
+print(chartValidation);
+//compute RMSE for validation data
+// Get array of observation and prediction values 
+var observationValidation = ee.Array(sampleValidation.aggregate_array('REDOX_CM'));
+var predictionValidation = ee.Array(sampleValidation.aggregate_array('predicted'));
+// Compute residuals
+var residualsValidation = observationValidation.subtract(predictionValidation);
+// Compute RMSE with equation, print it
+var rmseValidation = residualsValidation.pow(2).reduce('mean', [0]).sqrt();
+print('Validation RMSE', rmseValidation);
+//Export
+// create file name for export
+var exportName = roiName + '_' + 'DSM_regression';
+
+// If using gmail: Export to Drive
+Export.image.toDrive({image: regression,
+    description: exportName,
+    folder: "DigitalSoilMapping",               
+    fileNamePrefix: exportName,
+    region: compositeArea,
+    scale: 30,
+    crs: crs,
+    maxPixels: 1e13});
+
+/*
+// If using USDA acct: Export to Cloud Storage
+// Export loss layers to cloud storage
+Export.image.toCloudStorage({image: regression,
+    description: exportName,
+    bucket: cloudStorageBucket,               // update with name of Cloud Storage Bucket here
+    fileNamePrefix: exportName,
+    region: compositeArea,
+    scale: 30,
+    crs: crs,
+    maxPixels: 1e13});
+*/
